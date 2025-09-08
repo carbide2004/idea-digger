@@ -1,175 +1,120 @@
 import os
-import logging
-import arxiv
-import requests
-import PyPDF2
+from langchain_tavily import TavilySearch
+from langchain_community.tools import ArxivQueryRun
+from langchain_community.utilities import ArxivAPIWrapper
+from langchain.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain import hub
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain.prompts.prompt import PromptTemplate
 import google.generativeai as genai
 from dotenv import load_dotenv
-import difflib
-from knowledge_base import load_knowledge_base, add_to_knowledge_base, get_from_knowledge_base
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv() # Load environment variables from .env file
+
+# 工具1：网页搜索工具 (Tavily)
+# Tavily 相比普通搜索更适合Agent，它会返回精炼的、适合LLM处理的结果
+web_search_tool = TavilySearch(max_results=3, description="用于搜索最新的实时信息、趋势和广泛的公众知识。")
+
+# 工具2：Arxiv 论文检索工具
+# 限制只返回最相关的一篇论文的摘要，以提高效率
+arxiv_tool = ArxivQueryRun(
+    api_wrapper=ArxivAPIWrapper(top_k_results=1, load_max_docs=1),
+    description="用于查询和获取特定学术领域的科学论文摘要，尤其是前沿科技和理论研究。"
+)
+
+# 工具3：自定义的核心 - 内容分析与Idea挖掘工具
+@tool("Content Analyzer and Idea Miner")
+def analyze_content(content: str) -> str:
+    """
+    当获取了足够的信息（例如论文摘要或搜索结果）后，使用此工具进行深度分析。
+    输入检索到的文本内容，此工具会分析其核心贡献、潜在局限性，并提出未来可研究的3个具体方向。
+    """
+    analyzer_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
+    
+    prompt = f"""
+    根据以下内容，请进行深入的“Idea挖掘”分析：
+    ---
+    {content}
+    ---
+    
+    请严格按照以下结构输出你的分析报告：
+    1.  **核心思想 (Core Idea)**: 这份内容的关键信息或论文的核心贡献是什么？
+    2.  **潜在局限性 (Limitations)**: 基于现有信息，这个技术、方法或观点可能存在哪些未被提及的缺点或挑战？
+    3.  **创新点挖掘 (Idea Mining)**: 请基于其局限性或现有框架，提出3个具体、可执行的、新颖的研究点或改进方向。
+    """
+    
+    response = analyzer_llm.invoke(prompt)
+    return response.content
+
+# 将所有工具放入一个列表
+tools = [web_search_tool, arxiv_tool, analyze_content]
 
 class Agent:
     def __init__(self, api_key):
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-flash')
+        self.chat_history = []
 
-    def run(self, user_idea):
-        print("Agent: 正在分析您的想法...")
-        analysis_prompt = f"请分析以下用户提出的想法：'{user_idea}'。判断是否需要进行 arXiv 论文检索来补充或验证这个想法。如果需要，请在你的回答最后给出3-5个相关的关键词，这些关键词应该被包装在<keywords></keywords>标签中，用逗号','分隔。如果不需要，请直接回答'不需要检索'。"
-        response = self.model.generate_content(analysis_prompt)
-        analysis_text = response.text.strip()
-        print(f"Agent的原始回答: \n{analysis_text}")
+        # 初始化LangChain Agent
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        prompt_hub_template = hub.pull("hwchase17/react")
+        custom_prompt_template = """
+回答以下问题，尽你所能。你有权使用以下工具：
 
-        import re
-        keywords_match = re.search(r'<keywords>(.*?)</keywords>', analysis_text, re.DOTALL)
-        if keywords_match:
-            keywords = [k.strip() for k in keywords_match.group(1).split(',') if k.strip()]
-            if not keywords:
-                print("Agent: 未能从模型响应中提取到有效关键词，将不进行论文检索。")
-                self._brainstorm_with_user(user_idea, [])
-                return
-            all_analysis_results = []
-            for keyword in keywords:
-                results = self._paper_search(keyword.strip())
-                if not results:
-                    print(f"Agent: 未找到与关键词 '{keyword.strip()}' 相关的论文或分析结果。")
-                    continue
+{tools}
 
-                for item in results:
-                    if item["source"] == "local":
-                        all_analysis_results.append(f"本地知识库中论文 '{item['paper_id']}' 的分析结果:\n{item['analysis_result']}")
-                    elif item["source"] == "arxiv":
-                        analysis_result = self._analyze_paper(item["paper_path"])
-                        if analysis_result:
-                            all_analysis_results.append(f"论文 '{item['paper_id']}' 分析结果:\n{analysis_result}")
-            self._brainstorm_with_user(user_idea, all_analysis_results)
-        else:
-            self._brainstorm_with_user(user_idea, [])
+使用以下格式：
 
-    def _paper_search(self, query):
-        logging.info(f"正在搜索相关论文：{query}")
-        local_results = self._local_search(query)
-        if local_results:
-            return local_results
-        arxiv_results = self._arxiv_search(query)
-        if arxiv_results:
-            return arxiv_results
-        return []
+Question: 你必须回答的输入问题
+Thought: 你应该时刻思考该做什么。**在决定行动之前，请先评估问题的性质。如果问题可以用你的通用知识回答，就直接回答。如果需要检索，请判断使用哪个工具更合适（网页搜索用于快速、广泛的信息；Arxiv用于深度、专业的学术信息）。并在思考中说明你选择的理由以及预估这会增加一些处理时间，以体现你在效率和质量间的权衡。**
+Action: 应该采取的行动，应为[{tool_names}]中的一个
+Action Input: 对行动的输入
+Observation: 行动的结果
+...（这个Thought/Action/Action Input/Observation的过程可以重复N次）
+Thought: 我现在知道最终答案了
+Final Answer: 对原始输入问题的最终回答
 
-    def _local_search(self, query):
-        """
-        从本地知识库中检索与查询相关的论文分析结果
-        
-        参数:
-            query: 搜索查询字符串
-            
-        返回:
-            包含匹配论文信息的列表，格式为:
-            [{"paper_id": str, "analysis_result": str, "source": "local"}, ...]
-            如果没有匹配项则返回空列表
-        """
-        logging.info(f"正在从本地知识库搜索相关论文：{query}")
+开始！
 
-        kb = load_knowledge_base()
-        local_results = []
-        for paper_id, analysis_result in kb.items():
-            # 使用difflib进行模糊匹配，判断查询字符串与已存储论文标题的相似度
-            if difflib.SequenceMatcher(None, query.lower(), paper_id.lower()).ratio() > 0.8:
-                logging.info(f"从本地知识库中找到匹配的分析结果：{paper_id}")
-                local_results.append({
-                    "paper_id": paper_id,
-                    "analysis_result": analysis_result,
-                    "source": "local"
-                })
-        logging.info(f"从本地知识库中找到 {len(local_results)} 条匹配结果")
-        return local_results
+Question: {input}
+Thought:{agent_scratchpad}
+"""
+        prompt = PromptTemplate.from_template(custom_prompt_template)
+        self.langchain_agent = create_react_agent(llm, tools, prompt)
+        self.agent_executor = AgentExecutor(
+            agent=self.langchain_agent,
+            tools=tools,
+            verbose=True,
+            handle_parsing_errors=True
+        )
 
-    def _arxiv_search(self, query):
-        logging.info(f"正在 arXiv 上搜索相关论文：{query}")
-            
-        try:
-            search = arxiv.Search(
-                query=query,
-                max_results=5,
-                sort_by=arxiv.SortCriterion.Relevance
-            )
-            papers = []
-            for result in search.results():
-                papers.append(result)
-
-            if not os.path.exists("papers"):
-                os.makedirs("papers")
-
-            arxiv_results = []
-            for paper in papers:
-                try:
-                    filename = f"papers/{paper.title.replace('/', '_')}.pdf"
-                    paper.download_pdf(filename=filename)
-                    arxiv_results.append({
-                        "paper_id": paper.title.replace('/', '_'),
-                        "paper_path": filename,
-                        "source": "arxiv"
-                    })
-                    logging.info(f"已下载论文：{filename}")
-                except Exception as e:
-                    logging.error(f"下载论文 {paper.title} 失败：{e}")
-            logging.info(f"从 arXiv 中找到 {len(arxiv_results)} 条匹配结果")
-            return arxiv_results
-        except Exception as e:
-            logging.error(f"arXiv 搜索失败：{e}")
-            return []
-
-    def _analyze_paper(self, paper_path):
-        print(f"Agent: 正在分析论文 '{paper_path}'...")
-        from PyPDF2 import PdfReader
-
-        try:
-            reader = PdfReader(paper_path)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text() or ""
-            
-            if not text:
-                print(f"Agent: 无法从论文 '{paper_path}' 中提取文本。")
-                return None
-
-            prompt = f"请分析以下论文内容，指出其主要贡献、方法、结果以及可能的局限性：\n\n{text[:4000]}..."
-            response = self.model.generate_content(prompt)
-            analysis_result = response.text
-            add_to_knowledge_base(paper_path, analysis_result)
-            print("Agent: 论文分析完成。")
-            return analysis_result
-        except Exception as e:
-            logging.error(f"分析论文 '{paper_path}' 失败: {e}")
-            return None
-
-    def _brainstorm_with_user(self, user_idea, analysis_results):
-        print("Agent: 让我们一起头脑风暴，深化您的想法。")
-        brainstorm_prompt = f"用户想法：'{user_idea}'\n\n" \
-                            f"你之前给出的相关论文分析结果：\n{'' .join(analysis_results) if analysis_results else '无'}\n\n" \
-                            "请根据以上信息，指出用户想法的不足之处，并提出如何使其更具新颖性（novelty）和实用性（practicality）的建议。请以对话的形式进行，等待用户反馈。"
-        
-        response = self.model.generate_content(brainstorm_prompt)
-        print(f"Agent: {response.text}")
-
-        while True:
-            user_input = input("您的回复（输入'q'结束）：")
-            if user_input.lower() == 'q':
-                break
-            
-            follow_up_prompt = f"用户回复：'{user_input}'\n\n请继续进行头脑风暴，深化想法。"
-            response = self.model.generate_content(follow_up_prompt)
-            print(f"Agent: {response.text}")
+    def run(self, user_query):
+        response = self.agent_executor.invoke({
+            "input": user_query,
+            "chat_history": self.chat_history
+        })
+        self.chat_history.append(("user", user_query))
+        self.chat_history.append(("agent", response["output"]))
+        return response["output"]
 
 if __name__ == "__main__":
-    # Replace with your actual API key or load from environment variables
     API_KEY = os.getenv("GOOGLE_API_KEY") 
     if not API_KEY:
         print("请设置 GOOGLE_API_KEY 环境变量。")
     else:
         agent = Agent(API_KEY)
-        user_idea = input("请输入您的想法：")
-        agent.run(user_idea)
+        print("欢迎使用Idea挖掘Agent！输入您的问题，或输入 'exit' 退出。")
+        while True:
+            user_input = input("\n您的问题: ")
+            if user_input.lower() == 'exit':
+                print("感谢使用，再见！")
+                break
+            
+            try:
+                response = agent.run(user_input)
+                print("\n--- Agent的回答 ---")
+                print(response)
+            except Exception as e:
+                print(f"发生错误: {e}")
+                print("请尝试重新提问。")
